@@ -3,21 +3,20 @@ import cv2
 import numpy as np
 import easyocr
 from PIL import Image
-import re  # 引入正規表達式模組，用來過濾車牌格式
+import re
 
-# 1. 設定網頁標題與版面寬度
+# 1. 設定網頁標題
 st.set_page_config(page_title="車牌辨識與自動放大系統", page_icon="🚗", layout="wide")
 
 # 2. 載入模型 (快取加速)
-@st.cache_resource(show_spinner="📥 系統正在喚醒 AI 模型 (初次執行約需 30~60 秒，請耐心等候)...")
+@st.cache_resource(show_spinner="📥 系統正在喚醒 AI 模型，請耐心等候...")
 def load_model():
     return easyocr.Reader(['en'], gpu=False)
 
 reader = load_model()
 
-# 3. 自動縮圖函數 (加速核心)
-def resize_image(image, max_width=1000):
-    """如果圖片太寬，依比例縮小，大幅加快 AI 辨識速度"""
+# 3. 自動縮圖函數 (最大寬度設為 1280 保持足夠細節)
+def resize_image(image, max_width=1280):
     h, w = image.shape[:2]
     if w > max_width:
         ratio = max_width / w
@@ -26,68 +25,79 @@ def resize_image(image, max_width=1000):
         return resized_img
     return image
 
-# --- 網頁介面開始 ---
-st.title("📸 車牌照片自動辨識與放大系統 (高準度版)")
-st.write("請上傳一張包含車牌的照片，系統會自動強化影像、過濾雜訊，並精準抓取車牌號碼。")
+# --- 網頁介面 ---
+st.title("📸 車牌照片自動辨識與放大系統 (終極精準版)")
+st.write("已加入【浮水印空間排除】與【內部光學放大】技術。")
 
 uploaded_file = st.file_uploader("選擇圖片檔案...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # 讀取圖片並確保為 RGB 格式
+    # 讀取圖片並轉為 RGB
     image = Image.open(uploaded_file)
     img_np = np.array(image.convert('RGB'))
     
-    # 執行縮圖以提升速度
+    # 縮小原圖以加快速度
     img_np = resize_image(img_np)
     
-    # --- 影像強化 (讓 AI 看得更清楚) ---
-    # 將圖片轉為灰階，並使用 CLAHE 提升對比度，克服背光或反光問題
-    gray_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_img = clahe.apply(gray_img)
+    # 取得圖片的高度 (用來過濾浮水印)
+    img_h, img_w, _ = img_np.shape
     
-    with st.spinner('⏳ AI 正在強化影像並辨識車牌中，請稍候...'):
-        # 進行 OCR 辨識 (加入 allowlist 強制只辨識大寫英文、數字與連字號)
-        results = reader.readtext(enhanced_img, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
+    with st.spinner('⏳ AI 正在深度掃描並辨識車牌中，請稍候...'):
+        # --- 核心升級：加入高階辨識參數 ---
+        # mag_ratio=2.5: 在 AI 辨識前先將圖片放大 2.5 倍 (專治 N/M 不分)
+        # adjust_contrast=True: 讓 AI 自動修復背光問題
+        results = reader.readtext(
+            img_np, 
+            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+            mag_ratio=2.5,         
+            adjust_contrast=True   
+        )
         
     if not results:
-        st.warning("⚠️ 找不到任何文字或車牌，請嘗試更清晰的照片。")
+        st.warning("⚠️ 找不到任何符合的車牌。")
     else:
         col1, col2 = st.columns([2, 1])
         
-        # 複製一張原圖用來畫綠色框框 (維持彩色)
         img_with_boxes = img_np.copy()
         valid_detections = []
 
         for (bbox, text, prob) in results:
-            # 1. 信心度過濾：低於 40% 的雜訊直接忽略
-            if prob < 0.4:
-                continue
-            
-            # 2. 強制轉為大寫字串 (雙重保險)
-            text = text.upper()
-            
-            # 3. 格式過濾 (Regex)：台灣車牌通常包含 '-'，且前後為 2~4 個英數字
-            # 如果不符合這個格式 (例如左下角的時間浮水印)，就跳過不處理
-            if not re.search(r'[A-Z0-9]{2,4}-[A-Z0-9]{2,4}', text):
-                continue
-                
-            # --- 取得座標並畫框 ---
+            # 取得座標
             (tl, tr, br, bl) = bbox
             tl = (int(tl[0]), int(tl[1]))
             br = (int(br[0]), int(br[1]))
             
+            # 計算這個文字的「中心點 Y 座標」
+            center_y = (tl[1] + br[1]) / 2
+            
+            # --- 殺手鐧 1：空間位置過濾 (排除浮水印) ---
+            # 如果文字出現在畫面最底部 15% 或最頂部 10% 區域，認定為行車紀錄器浮水印，直接丟棄！
+            if center_y > (img_h * 0.85) or center_y < (img_h * 0.10):
+                continue
+            
+            # --- 殺手鐧 2：嚴格的正規表達式 ---
+            text = text.upper()
+            
+            # 清除可能誤判的開頭或結尾符號 (例如不小心把邊框認成 - )
+            text = text.strip('-')
+            
+            # 檢查是否符合 車牌格式 (2~4碼英數 + 一個橫槓 + 2~4碼英數)
+            if not re.search(r'^[A-Z0-9]{2,4}-[A-Z0-9]{2,4}$', text):
+                continue
+                
+            # 信心度過濾
+            if prob < 0.3:
+                continue
+
+            # --- 畫框與裁切 ---
             cv2.rectangle(img_with_boxes, tl, br, (0, 255, 0), 3)
             
-            # --- 自動裁切 (放大) ---
-            h, w, _ = img_np.shape
-            padding = 10  # 邊界留白
+            padding = 10 
             y1 = max(0, tl[1] - padding)
-            y2 = min(h, br[1] + padding)
+            y2 = min(img_h, br[1] + padding)
             x1 = max(0, tl[0] - padding)
-            x2 = min(w, br[0] + padding)
+            x2 = min(img_w, br[0] + padding)
             
-            # 從原圖 (彩色) 中切出車牌區域
             cropped_img = img_np[y1:y2, x1:x2]
             
             valid_detections.append({
@@ -96,16 +106,15 @@ if uploaded_file is not None:
                 "prob": prob
             })
 
-        # --- 顯示左側畫面 ---
+        # --- 顯示畫面 ---
         with col1:
-            st.subheader("原始圖片 (自動定位)")
+            st.subheader("原始圖片 (自動過濾浮水印)")
             st.image(img_with_boxes, use_column_width=True)
 
-        # --- 顯示右側畫面 ---
         with col2:
             st.subheader("🔍 放大車牌 & 辨識結果")
             if len(valid_detections) == 0:
-                st.info("沒有找到符合標準的車牌。 (已自動過濾掉日期與雜訊)")
+                st.info("沒有找到符合標準的車牌。")
             else:
                 for det in valid_detections:
                     st.image(det["cropped"], use_column_width=True)

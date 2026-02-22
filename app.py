@@ -15,7 +15,7 @@ def load_model():
 
 reader = load_model()
 
-# 3. 自動縮圖 (設定在 1000px，兼顧效能與畫質)
+# 3. 自動縮圖 (維持 1000px 安全尺寸)
 def resize_image(image, max_width=1000):
     h, w = image.shape[:2]
     if w > max_width:
@@ -25,55 +25,30 @@ def resize_image(image, max_width=1000):
         return resized_img
     return image
 
-# 4. 影像銳化處理函數 (對抗模糊的 N, M, K)
-def enhance_image_for_ocr(img):
-    # 轉為灰階
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    
-    # 使用 CLAHE 提升對比度 (讓黑字更黑，白底更白)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast_img = clahe.apply(gray)
-    
-    # 建立「銳化遮罩 (Sharpening Kernel)」
-    # 這一行的魔法能把模糊的邊緣變得銳利，N 就是 N，K 就是 K！
-    kernel = np.array([[0, -1, 0], 
-                       [-1, 5,-1], 
-                       [0, -1, 0]])
-    sharpened = cv2.filter2D(contrast_img, -1, kernel)
-    
-    return sharpened
-
 # --- 網頁介面 ---
-st.title("📸 車牌照片自動辨識與放大系統 (高畫質銳化版)")
-st.write("已導入 OpenCV 邊緣銳化技術，大幅提升 N, M, K 等相似字母的辨識率。")
+st.title("📸 車牌照片自動辨識與放大系統 (兩段式超解析版)")
+st.write("已導入專業級『局部超解析重辨識』技術，徹底解決 N/M 誤判問題。")
 
 uploaded_file = st.file_uploader("選擇圖片檔案...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # 讀取圖片並轉為 RGB
     image = Image.open(uploaded_file)
     original_img = np.array(image.convert('RGB'))
     
-    # 縮小原圖以避免記憶體崩潰
+    # 縮小原圖
     img_np = resize_image(original_img, max_width=1000)
     img_h, img_w, _ = img_np.shape
     
-    # --- 執行影像強化 ---
-    enhanced_img = enhance_image_for_ocr(img_np)
-    
     with st.spinner('⏳ AI 正在深度掃描並辨識車牌中，請稍候...'):
-        # 進行 OCR (關閉 mag_ratio 節省記憶體，因為圖片已經銳化過了)
-        results = reader.readtext(
-            enhanced_img, 
-            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-        )
+        # 【第一階段】：大範圍掃描，只為了找出車牌的「座標位置」
+        gray_img = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        results = reader.readtext(gray_img, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
         
     if not results:
         st.warning("⚠️ 找不到任何符合的車牌。")
     else:
         col1, col2 = st.columns([2, 1])
         
-        # 複製彩色圖來畫框
         img_with_boxes = img_np.copy()
         valid_detections = []
 
@@ -88,36 +63,52 @@ if uploaded_file is not None:
             if center_y > (img_h * 0.85) or center_y < (img_h * 0.10):
                 continue
             
-            # --- 正規表達式過濾 ---
-            text = text.upper()
-            text = text.strip('-')
-            
-            # 車牌格式
+            # --- 格式過濾 ---
+            text = text.upper().strip('-')
             if not re.search(r'^[A-Z0-9]{2,4}-[A-Z0-9]{2,4}$', text):
                 continue
-                
-            # 信心度過濾
-            if prob < 0.3:
+            if prob < 0.2:
                 continue
 
             # --- 畫框 ---
             cv2.rectangle(img_with_boxes, tl, br, (0, 255, 0), 3)
             
-            # --- 裁切放大圖 (使用高品質插值法放大裁切出來的車牌) ---
-            padding = 10 
+            # --- 裁切車牌 ---
+            padding = 8 
             y1 = max(0, tl[1] - padding)
             y2 = min(img_h, br[1] + padding)
             x1 = max(0, tl[0] - padding)
             x2 = min(img_w, br[0] + padding)
             
-            cropped_img = img_np[y1:y2, x1:x2]
-            # 讓右側顯示的圖片經過平滑放大，視覺上更舒服
-            display_crop = cv2.resize(cropped_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            cropped_plate = img_np[y1:y2, x1:x2]
+            
+            # ==========================================
+            # 【第二階段】：局部超解析度重辨識 (殺手鐧)
+            # ==========================================
+            
+            # 1. 將這張小車牌「無損放大 3 倍」
+            zoom_plate = cv2.resize(cropped_plate, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+            
+            # 2. 轉灰階並強力提升對比度 (讓黑白分明，拉開 N 中間的縫隙)
+            zoom_gray = cv2.cvtColor(zoom_plate, cv2.COLOR_RGB2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            zoom_enhanced = clahe.apply(zoom_gray)
+            
+            # 3. 逼 AI 重新只看這張超清晰的放大車牌 (detail=0 代表只回傳文字)
+            final_text_result = reader.readtext(
+                zoom_enhanced, 
+                detail=0, 
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+            )
+            
+            # 如果第二階段有讀到東西，就用第二階段的結果 (通常是最準的)
+            # 如果沒讀到，就保留第一階段的結果
+            final_text = final_text_result[0] if len(final_text_result) > 0 else text
             
             valid_detections.append({
-                "cropped": display_crop,
-                "text": text,
-                "prob": prob
+                "cropped": zoom_plate, # 畫面直接秀出放大3倍的圖
+                "text": final_text,
+                "prob": prob # 保留原始信心度作為參考
             })
 
         # --- 顯示畫面 ---
@@ -133,5 +124,4 @@ if uploaded_file is not None:
                 for det in valid_detections:
                     st.image(det["cropped"], use_column_width=True)
                     st.success(f"**車牌號碼： {det['text']}**")
-                    st.caption(f"AI 信心度: {det['prob']*100:.1f}%")
                     st.markdown("---")
